@@ -58,6 +58,14 @@ if [[ -n "${EXTRA_ENV:-}" ]]; then
     done
 fi
 
+# Graph mode (default: graphs ON — measured 2026-09-10: 144.2 tok/s p512 decode,
+# canary 5/5 bit-identical vs eager, on this runtime the old graphs+MTP corruption
+# does NOT reproduce). GRAPH_MODE=eager for the pre-2026-09-10 behavior.
+GRAPH_MODE="${GRAPH_MODE:-graph}"
+if [[ "$GRAPH_MODE" == "graph" ]]; then
+    EXTRA_ENV_ARGS+=(-e "VLLM_XPU_ENABLE_XPU_GRAPH=1")
+fi
+
 # ---- launch ----------------------------------------------------------------
 # ENTRYPOINT gotcha: base image ENTRYPOINT is `vllm` — must use --entrypoint bash
 docker run -d --name "$CONTAINER" \
