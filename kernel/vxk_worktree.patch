@@ -1,0 +1,541 @@
+diff --git a/csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp b/csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp
+index 4e369ad..773ed64 100644
+--- a/csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp
++++ b/csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp
+@@ -58,3 +58,23 @@ torch::Tensor cutlass_grouped_gemm_interface(
+ #endif
+   }
+ }
++
++torch::Tensor xe2_block_fp8_small_m(
++    const torch::Tensor& A,
++    const torch::Tensor& B,
++    const torch::Tensor& B_scale,
++    const c10::optional<torch::Tensor>& bias) {
++  TORCH_CHECK(
++      !vllm::xpu::force_xe_default_kernel(),
++      "xe2_block_fp8_small_m cannot use the XE-default kernel path");
++  TORCH_CHECK(
++      vllm::xpu::is_xe2_arch() || vllm::xpu::is_xe3_arch(),
++      "xe2_block_fp8_small_m requires an Xe2/Xe3 architecture");
++#ifdef VLLM_XPU_ENABLE_XE2
++  return xe2_block_fp8_small_m_xe2(A, B, B_scale, bias);
++#else
++  TORCH_CHECK(
++      false,
++      "xe2_block_fp8_small_m requires VLLM_XPU_ENABLE_XE2");
++#endif
++}
+diff --git a/csrc/xpu/grouped_gemm/grouped_gemm_interface.h b/csrc/xpu/grouped_gemm/grouped_gemm_interface.h
+index c820fed..f03e11f 100644
+--- a/csrc/xpu/grouped_gemm/grouped_gemm_interface.h
++++ b/csrc/xpu/grouped_gemm/grouped_gemm_interface.h
+@@ -11,3 +11,9 @@ torch::Tensor cutlass_grouped_gemm_interface(
+     int64_t N,
+     int64_t K,
+     int64_t num_experts);
++
++torch::Tensor xe2_block_fp8_small_m(
++    const torch::Tensor& A,
++    const torch::Tensor& B,
++    const torch::Tensor& B_scale,
++    const c10::optional<torch::Tensor>& bias);
+diff --git a/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp b/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp
+index ac2d7d6..a6e6713 100644
+--- a/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp
++++ b/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp
+@@ -233,6 +233,187 @@ CUTE_DEVICE void xe_gemm(
+   copy(copy_c, tCrC_out, tCgC);
+ }
+ 
++template <
++    class GmemTiledCopyA,
++    class GmemTiledCopyB,
++    class GmemTiledCopyC,
++    class ATensor,
++    class BTensor,
++    class DTensor,
++    class TiledMMA,
++    typename ElementS,
++    typename ElementBI>
++CUTE_DEVICE void xe_gemm_block_fp8(
++    ATensor const& A,  // (M,K)
++    BTensor const& B,  // (N,K)
++    const ElementS* Scales,  // contiguous [K/128, N/128]
++    const ElementBI* Bias,
++    DTensor& C,  // (M,N)
++    Coord<int, int, cute::Underscore, int> blk_coord,
++    TiledMMA const& mma) {
++  using TB = typename BTensor::element_type;
++  static_assert(
++      std::is_same_v<TB, cutlass::float_e4m3_t>,
++      "xe_gemm_block_fp8 only supports FP8 E4M3 weights");
++  static_assert(
++      std::is_same_v<ElementS, float>,
++      "xe_gemm_block_fp8 requires FP32 scales");
++
++  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
++  auto wg_m = get<0>(blk_coord);
++  auto wg_n = get<1>(blk_coord);
++  int local_id = item.get_local_linear_id();
++
++  Tensor cA = make_identity_tensor(A.shape());
++  Tensor cB = make_identity_tensor(B.shape());
++  Tensor cC = make_identity_tensor(C.shape());
++
++  auto wg_tile = mma.tile_mnk();
++  auto wg_coord = make_coord(wg_m, wg_n, 0);
++
++  Tensor gA = local_tile(
++      cA, select<0, 2>(wg_tile), make_coord(wg_m, _));  // (BLK_M,BLK_K,k)
++  Tensor gB = local_tile(
++      cB, select<1, 2>(wg_tile), make_coord(wg_n, _));  // (BLK_N,BLK_K,k)
++  Tensor gC =
++      local_tile(cC, wg_tile, wg_coord, Step<_1, _1, X>{});  // (BLK_M,BLK_N)
++
++  auto copy_a = get_block_2d_copy_A<GmemTiledCopyA>(mma, A);
++  auto copy_b = get_block_2d_copy_B<GmemTiledCopyB>(mma, B);
++  auto copy_c = get_block_2d_copy_D<GmemTiledCopyC>(mma, C);
++
++  auto thr_mma = mma.get_slice(local_id);
++  auto thr_copy_a = copy_a.get_slice(local_id);
++  auto thr_copy_b = copy_b.get_slice(local_id);
++  auto thr_copy_c = copy_c.get_slice(local_id);
++
++  auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
++  auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
++
++  auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
++  auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
++
++  Tensor tAgA = thr_copy_a.partition_S(gA);
++  Tensor tBgB = thr_copy_b.partition_S(gB);
++
++  auto tCrC = thr_mma.partition_sg_fragment_C(gC);
++  auto tCrC_block = make_fragment_like(tCrC);
++  auto tCrC_out = thr_copy_c.partition_sg_fragment_S(gC);
++  auto tCgC = thr_copy_c.partition_D(gC);
++
++  auto prefetch_a = make_block_2d_prefetch(copy_a);
++  auto prefetch_b = make_block_2d_prefetch(copy_b);
++
++  auto thr_prefetch_A = prefetch_a.get_slice(local_id);
++  auto thr_prefetch_B = prefetch_b.get_slice(local_id);
++
++  auto pAgA = thr_prefetch_A.partition_S(gA);
++  auto pBgB = thr_prefetch_B.partition_S(gB);
++
++  constexpr int prefetch_dist = 3;
++  constexpr int barrier_scope = 2;
++  constexpr int block_k = 128;
++  constexpr int block_n = 128;
++
++  static constexpr auto tile_m = get<0>(wg_tile);
++  static constexpr auto tile_n = get<1>(wg_tile);
++  static constexpr auto tile_k = get<2>(wg_tile);
++
++  static_assert(
++      block_k % tile_k == 0,
++      "The Xe2 FP8 K tile must divide the K=128 scale block");
++  static_assert(
++      tile_n <= block_n && block_n % tile_n == 0,
++      "The Xe2 FP8 N tile must fit within and divide the N=128 scale block");
++
++  constexpr int k_tiles_per_scale = block_k / tile_k;
++
++  int k_tile_count = ceil_div(shape<1>(A), tile_k);
++  int k_tile_prefetch = 0;
++
++  const int n_blocks = shape<0>(B) / block_n;
++  const int n_block_idx = (wg_n * tile_n) / block_n;
++
++  clear(tCrC);
++  clear(tCrC_block);
++
++  CUTE_UNROLL
++  for (; k_tile_prefetch < prefetch_dist; ++k_tile_prefetch) {
++    if (k_tile_prefetch < k_tile_count) {
++      prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
++      prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
++    }
++  }
++
++  for (int k_tile = 0; k_tile < k_tile_count;
++       ++k_tile, ++k_tile_prefetch) {
++    barrier_arrive(barrier_scope);
++
++    copy(copy_a, tAgA(_, _, _, k_tile), tArA);
++    copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
++
++    if (k_tile_prefetch < k_tile_count) {
++      prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
++      prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
++    }
++
++    reorder(tArA, tCrA);
++    reorder(tBrB, tCrB);
++
++    // DPAS/XMX accumulation for one part of the current K=128 block.
++    cute::gemm(mma, tCrA, tCrB, tCrC_block);
++
++    const bool end_of_scale_block =
++        ((k_tile + 1) % k_tiles_per_scale) == 0;
++
++    if (end_of_scale_block) {
++      const int k_block_idx = (k_tile * tile_k) / block_k;
++      const float B_scale =
++          Scales[k_block_idx * n_blocks + n_block_idx];
++
++      CUTLASS_PRAGMA_UNROLL
++      for (int i = 0; i < tCrC.size(); ++i) {
++        tCrC(i) += tCrC_block(i) * B_scale;
++      }
++      clear(tCrC_block);
++    }
++
++    barrier_wait(barrier_scope);
++  }
++
++  if (Bias != nullptr) {
++    static constexpr auto ATOM_M =
++        get<1>(typename TiledMMA::ThrLayoutVMNK{}.shape());
++    static constexpr auto ATOM_N =
++        get<2>(typename TiledMMA::ThrLayoutVMNK{}.shape());
++
++    auto sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N;
++
++    static constexpr auto SG_M = tile_m / ATOM_M;
++    static constexpr auto SG_N = tile_n / ATOM_N;
++
++    int sg_local_id = cutlass::get_sub_group_local_id();
++    static constexpr int sg_local_range = 16;
++
++    int n_tile_start = wg_n * tile_n;
++    int n_sg_start = sg_local_n_coord * SG_N;
++
++    CUTLASS_PRAGMA_UNROLL
++    for (int sn = 0; sn < SG_N / sg_local_range; ++sn) {
++      int sg_local_n = sn * sg_local_range + sg_local_id;
++      float b_float = Bias[n_tile_start + n_sg_start + sg_local_n];
++
++      CUTLASS_PRAGMA_UNROLL
++      for (int sm = 0; sm < SG_M; ++sm) {
++        tCrC(sn * SG_M + sm) += b_float;
++      }
++    }
++  }
++
++  reorder(tCrC, tCrC_out);
++  copy(copy_c, tCrC_out, tCgC);
++}
++
+ template <
+     class GmemTiledCopyA,
+     class GmemTiledCopyB,
+@@ -244,6 +425,8 @@ template <
+     class TiledMMA,
+     typename ElementS,
+     typename ElementBI>
++
++
+ CUTE_DEVICE void xe_gemm_4bits(
+     ATensor const& A,  // (M,K)
+     BTensor const& B,  // (N,K)
+diff --git a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.cpp b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.cpp
+index 364b29a..e1876db 100644
+--- a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.cpp
++++ b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.cpp
+@@ -23,3 +23,11 @@ torch::Tensor cutlass_grouped_gemm_xe2(
+       K,
+       num_experts);
+ }
++
++torch::Tensor xe2_block_fp8_small_m_xe2(
++    const torch::Tensor& A,
++    const torch::Tensor& B,
++    const torch::Tensor& B_scale,
++    const c10::optional<torch::Tensor>& bias) {
++  return MoE::xe2_block_fp8_small_m_impl(A, B, B_scale, bias);
++}
+diff --git a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.h b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.h
+index e37a5a3..60dbdda 100644
+--- a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.h
++++ b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.h
+@@ -10,3 +10,9 @@ torch::Tensor cutlass_grouped_gemm_xe2(
+     int64_t N,
+     int64_t K,
+     int64_t num_experts);
++
++torch::Tensor xe2_block_fp8_small_m_xe2(
++    const torch::Tensor& A,
++    const torch::Tensor& B,
++    const torch::Tensor& B_scale,
++    const c10::optional<torch::Tensor>& bias);
+diff --git a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp
+index 2cf77c6..d4c1dbf 100644
+--- a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp
++++ b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2.hpp
+@@ -65,6 +65,7 @@ template <
+     char LayoutKindA,
+     char LayoutKindB,
+     char LayoutKindD,
++    bool BlockScaledFP8,
+     class TiledMMA,
+     typename ElementA,
+     typename ElementB,
+@@ -142,10 +143,13 @@ CUTE_DEVICE void MoEGEMM(
+         const_cast<ElementA*>(Activations) + pre_rows * gemm_k;
+     ElementB* ptr_B_curr_batch = const_cast<ElementB*>(Weights) + B_offset;
+     ElementD* ptr_D_curr_batch = Outputs + pre_rows * gemm_n;
+-    ElementS* ptr_Scales_curr_batch = const_cast<ElementS*>(Scales) + expert_id;
++    ElementS* ptr_Scales_curr_batch = const_cast<ElementS*>(Scales);
+     if constexpr (is_B_4bits) {
+       ptr_Scales_curr_batch =
+           const_cast<ElementS*>(Scales) + B_offset * 2 / group_size;
++    } else if constexpr (!BlockScaledFP8) {
++      // Existing FP8 grouped GEMM uses one scalar scale per expert.
++      ptr_Scales_curr_batch += expert_id;
+     }
+     ElementBI* ptr_Bias_curr_batch = nullptr;
+     if (Bias != static_cast<ElementBI*>(nullptr)) {
+@@ -195,14 +199,28 @@ CUTE_DEVICE void MoEGEMM(
+         }
+ #undef XE_GEMM_4BITS_CALLER
+       } else {
+-        xe_gemm<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD>(
+-            A_tensor,
+-            B_tensor,
+-            ptr_Scales_curr_batch,
+-            ptr_Bias_curr_batch,
+-            D_tensor,
+-            tile_coord,
+-            mma);
++        if constexpr (BlockScaledFP8) {
++          xe_gemm_block_fp8<
++              GmemTiledCopyA,
++              GmemTiledCopyB,
++              GmemTiledCopyD>(
++              A_tensor,
++              B_tensor,
++              ptr_Scales_curr_batch,
++              ptr_Bias_curr_batch,
++              D_tensor,
++              tile_coord,
++              mma);
++        } else {
++          xe_gemm<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD>(
++              A_tensor,
++              B_tensor,
++              ptr_Scales_curr_batch,
++              ptr_Bias_curr_batch,
++              D_tensor,
++              tile_coord,
++              mma);
++        }
+       }
+ 
+       if (local_id == 0) {
+diff --git a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp
+index 9ffaea8..873b57f 100644
+--- a/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp
++++ b/csrc/xpu/grouped_gemm/xe_2/grouped_gemm_xe2_interface.hpp
+@@ -64,13 +64,14 @@ namespace MoE {
+ using namespace cute;
+ 
+ // type tag to define a unique sycl kernel name
+-template <typename, typename, typename, typename, char, char, class>
++template <typename, typename, typename, typename, char, char, class, bool>
+ class GemmCuteName;
+ 
+ template <
+     char layoutA,
+     char layoutB,
+     class policy,
++    bool BlockScaledFP8,
+     typename ElementA,
+     typename ElementB,
+     typename ElementS,
+@@ -133,7 +134,8 @@ void MoEGEMMLauncher(
+         ElementD,
+         layoutA,
+         layoutB,
+-        policy>>(
++        policy,
++        BlockScaledFP8>>(
+         sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
+           MoE::MoEGEMM<
+               GmemTiledCopyA,
+@@ -141,7 +143,8 @@ void MoEGEMMLauncher(
+               GmemTiledCopyD,
+               layoutA,
+               layoutB,
+-              'R'>(
++              'R',
++              BlockScaledFP8>(
+               activations,
+               weights,
+               scales,
+@@ -227,7 +230,7 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
+ 
+ #define MoEGEMMLauncherCallER(                                                 \
+     LayoutA, LayoutB, Policy, ElementA, ElementB, ElementS)                    \
+-  MoEGEMMLauncher<LayoutA, LayoutB, Policy>(                                   \
++  MoEGEMMLauncher<LayoutA, LayoutB, Policy, false>(                                   \
+       dpcpp_queue,                                                             \
+       reinterpret_cast<ElementA*>(ptr_A.data_ptr()),                           \
+       reinterpret_cast<ElementB*>(ptr_B.data_ptr()),                           \
+@@ -371,4 +374,134 @@ at::Tensor cutlass_grouped_gemm_xe2_impl(
+ #undef MoEGEMMLauncherCallER
+   return ptr_D;
+ }
++
++at::Tensor xe2_block_fp8_small_m_impl(
++    const at::Tensor& A,
++    const at::Tensor& B,
++    const at::Tensor& B_scale,
++    const c10::optional<at::Tensor>& bias) {
++  const at::DeviceGuard device_guard(A.device());
++
++  TORCH_CHECK(A.is_xpu(), "A must be an XPU tensor");
++  TORCH_CHECK(B.is_xpu(), "B must be an XPU tensor");
++  TORCH_CHECK(B_scale.is_xpu(), "B_scale must be an XPU tensor");
++  TORCH_CHECK(B.device() == A.device(), "A and B must be on the same XPU device");
++  TORCH_CHECK(
++      B_scale.device() == A.device(),
++      "A and B_scale must be on the same XPU device");
++
++  TORCH_CHECK(A.dim() == 2, "A must be 2D [M, K]");
++  TORCH_CHECK(B.dim() == 2, "B must be 2D [K, N]");
++  TORCH_CHECK(
++      B_scale.dim() == 2,
++      "B_scale must be 2D [K/128, N/128]");
++
++  const int64_t M = A.size(0);
++  const int64_t K = A.size(1);
++
++  TORCH_CHECK(M >= 1 && M <= 40, "xe2_block_fp8_small_m requires 1 <= M <= 40");
++  TORCH_CHECK(K % 128 == 0, "K must be divisible by 128");
++  TORCH_CHECK(B.size(0) == K, "B must have shape [K, N]");
++
++  const int64_t N = B.size(1);
++
++  TORCH_CHECK(N % 128 == 0, "N must be divisible by 128");
++  TORCH_CHECK(
++      A.scalar_type() == at::kBFloat16 || A.scalar_type() == at::kHalf,
++      "A must be BF16 or FP16");
++  TORCH_CHECK(
++      B.scalar_type() == at::kFloat8_e4m3fn,
++      "B must be FP8 E4M3FN");
++  TORCH_CHECK(
++      B_scale.scalar_type() == at::kFloat,
++      "B_scale must be FP32");
++
++  TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
++  TORCH_CHECK(
++      B_scale.is_contiguous(),
++      "B_scale must be contiguous [K/128, N/128]");
++  TORCH_CHECK(
++      B_scale.size(0) == K / 128,
++      "B_scale.size(0) must equal K/128");
++  TORCH_CHECK(
++      B_scale.size(1) == N / 128,
++      "B_scale.size(1) must equal N/128");
++
++  const bool B_is_kn_contiguous = B.is_contiguous();
++  const bool B_is_transposed_nk =
++      B.stride(0) == 1 && B.stride(1) == K;
++
++  TORCH_CHECK(
++      B_is_kn_contiguous || B_is_transposed_nk,
++      "B must be contiguous [K, N] or a transpose view of contiguous [N, K]");
++
++  if (bias.has_value()) {
++    TORCH_CHECK(bias->is_xpu(), "bias must be an XPU tensor");
++    TORCH_CHECK(
++        bias->device() == A.device(),
++        "bias must be on the same XPU device as A");
++    TORCH_CHECK(bias->dim() == 1, "bias must be 1D [N]");
++    TORCH_CHECK(bias->size(0) == N, "bias must have N elements");
++    TORCH_CHECK(bias->is_contiguous(), "bias must be contiguous");
++    TORCH_CHECK(
++        bias->scalar_type() == A.scalar_type(),
++        "bias dtype must match A dtype");
++  }
++
++  auto& dpcpp_queue =
++      at::xpu::getCurrentXPUStream(A.device().index()).queue();
++
++  at::Tensor output =
++      at::empty({M, N}, A.options().dtype(at::kBFloat16));
++  at::Tensor rows_per_expert =
++      at::full({1}, M, A.options().dtype(at::kInt));
++  at::Tensor atomic_buffer =
++      at::empty({1}, A.options().dtype(at::kInt));
++
++#define XE2_BLOCK_FP8_LAUNCH(LayoutB, Policy, ElementAType)                    \
++  MoEGEMMLauncher<'R', LayoutB, Policy, true>(                                 \
++      dpcpp_queue,                                                             \
++      reinterpret_cast<const ElementAType*>(A.data_ptr()),                     \
++      reinterpret_cast<const float_e4m3_t*>(B.data_ptr()),                     \
++      reinterpret_cast<const float*>(B_scale.data_ptr()),                      \
++      bias.has_value()                                                         \
++          ? reinterpret_cast<const ElementAType*>(bias->data_ptr())            \
++          : static_cast<const ElementAType*>(nullptr),                         \
++      reinterpret_cast<bfloat16_t*>(output.data_ptr()),                        \
++      static_cast<int>(N),                                                     \
++      static_cast<int>(K),                                                     \
++      reinterpret_cast<const int*>(rows_per_expert.data_ptr()),                \
++      1,                                                                       \
++      128,                                                                     \
++      reinterpret_cast<int32_t*>(atomic_buffer.data_ptr()));
++
++#define XE2_BLOCK_FP8_SELECT_POLICY(LayoutB, ElementAType) \
++  if (M <= 8) {                                            \
++    using policy = w8a16_policy_m_16;                      \
++    XE2_BLOCK_FP8_LAUNCH(LayoutB, policy, ElementAType);   \
++  } else {                                                 \
++    using policy = w8a16_policy_m_32;                      \
++    XE2_BLOCK_FP8_LAUNCH(LayoutB, policy, ElementAType);   \
++  }
++
++  if (B_is_kn_contiguous) {
++    if (A.scalar_type() == at::kBFloat16) {
++      XE2_BLOCK_FP8_SELECT_POLICY('R', bfloat16_t);
++    } else {
++      XE2_BLOCK_FP8_SELECT_POLICY('R', half_t);
++    }
++  } else {
++    if (A.scalar_type() == at::kBFloat16) {
++      XE2_BLOCK_FP8_SELECT_POLICY('C', bfloat16_t);
++    } else {
++      XE2_BLOCK_FP8_SELECT_POLICY('C', half_t);
++    }
++  }
++
++#undef XE2_BLOCK_FP8_SELECT_POLICY
++#undef XE2_BLOCK_FP8_LAUNCH
++
++  return output;
++}
++
+ }  // namespace MoE
+\ No newline at end of file
+diff --git a/csrc/xpu/torch_bindings.cpp b/csrc/xpu/torch_bindings.cpp
+index 75eca16..2c3a1e3 100644
+--- a/csrc/xpu/torch_bindings.cpp
++++ b/csrc/xpu/torch_bindings.cpp
+@@ -51,6 +51,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
+       "cutlass_grouped_gemm_interface",
+       torch::kXPU,
+       &cutlass_grouped_gemm_interface);
++
++  xpu_ops.def(
++      "xe2_block_fp8_small_m(Tensor A, Tensor B, Tensor B_scale, "
++      "Tensor? bias) -> Tensor");
++  xpu_ops.impl(
++      "xe2_block_fp8_small_m",
++      torch::kXPU,
++      &xe2_block_fp8_small_m);
+ #endif
+ 
+   xpu_ops.def(

@@ -1,0 +1,59 @@
+--- stock-sources/v1__worker__xpu_worker.py	2026-08-14 05:09:34.000000000 +0000
++++ patched-sources/v1__worker__xpu_worker.py	2026-09-10 02:27:06.557459549 +0000
+@@ -40,6 +40,32 @@
+         assert current_platform.is_xpu()
+ 
+     def init_device(self):
++        import os as _os
++        if _os.environ.get("B70_WORKER_AFFINITY", "1") == "1" and (
++            (
++                int(self.parallel_config.pipeline_parallel_size) == 2
++                and int(self.parallel_config.tensor_parallel_size) == 1
++            )
++            or (
++                int(self.parallel_config.pipeline_parallel_size) == 1
++                and int(self.parallel_config.tensor_parallel_size) == 2
++            )
++        ):
++            import torch as _torch
++            _n = _torch.accelerator.device_count()
++            _rank = int(getattr(self, "rank", 0))
++            print(
++                f"[B70_WORKER_AFFINITY] pid={_os.getpid()} rank={_rank} "
++                f"visible={_n}",
++                flush=True,
++            )
++            if _n != 1:
++                raise RuntimeError(
++                    f"B70_WORKER_AFFINITY: rank {_rank} sees {_n} devices; "
++                    "spawn-time mask injection failed"
++                )
++            self.local_rank = 0
++            _os.environ["LOCAL_RANK"] = "0"
+         # In DP mode, XPU workers see all visible devices.
+         # Offset local_rank by the local DP shard.
+         parallel_config = self.parallel_config
+@@ -62,7 +88,22 @@
+             assert self.local_rank < visible_device_count, (
+                 f"DP adjusted local rank {self.local_rank} is out of bounds. "
+             )
+-            assert parallel_config.local_world_size <= visible_device_count, (
++            assert (
++                (
++                    os.environ.get("B70_WORKER_AFFINITY", "1") == "1"
++                    and (
++                        (
++                            int(parallel_config.pipeline_parallel_size) == 2
++                            and int(parallel_config.tensor_parallel_size) == 1
++                        )
++                        or (
++                            int(parallel_config.pipeline_parallel_size) == 1
++                            and int(parallel_config.tensor_parallel_size) == 2
++                        )
++                    )
++                )
++                or parallel_config.local_world_size <= visible_device_count
++            ), (
+                 f"local_world_size ({parallel_config.local_world_size}) must "
+                 f"be less than or equal to the number of visible devices "
+                 f"({visible_device_count})."

@@ -1,0 +1,26 @@
+--- stock-sources/v1__executor__multiproc_executor.py	2026-08-14 05:09:34.000000000 +0000
++++ patched-sources/v1__executor__multiproc_executor.py	2026-09-10 02:26:46.072855046 +0000
+@@ -184,6 +184,23 @@
+             cpu_omp_manager = OMPProcessManager(self.vllm_config)
+             for local_rank in range(self.local_world_size):
+                 global_rank = global_start_rank + local_rank
++                if os.environ.get("B70_WORKER_AFFINITY", "1") == "1" and (
++                    (
++                        int(self.vllm_config.parallel_config.pipeline_parallel_size) == 2
++                        and int(self.vllm_config.parallel_config.tensor_parallel_size) == 1
++                    )
++                    or (
++                        int(self.vllm_config.parallel_config.pipeline_parallel_size) == 1
++                        and int(self.vllm_config.parallel_config.tensor_parallel_size) == 2
++                    )
++                ):
++                    # Each worker interpreter inherits its own single-GPU mask
++                    os.environ["ZE_AFFINITY_MASK"] = str(global_rank)
++                    print(
++                        "[B70_WORKER_AFFINITY_SPAWN] "
++                        f"rank={global_rank} mask={global_rank}",
++                        flush=True,
++                    )
+                 is_driver_worker = self._is_driver_worker(global_rank)
+                 with cpu_omp_manager.configure_omp_envs(
+                     rank=global_rank, local_rank=local_rank

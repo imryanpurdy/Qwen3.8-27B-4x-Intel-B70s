@@ -1,0 +1,46 @@
+--- stock-sources/v1__worker__mamba_utils.py	2026-08-14 05:09:34.000000000 +0000
++++ patched-sources/v1__worker__mamba_utils.py	2026-09-10 02:27:28.112043394 +0000
+@@ -764,7 +764,13 @@
+ 
+                 for state_type_idx, state in enumerate(kv_caches):
+                     # Base address
+-                    self.state_base_addrs[idx] = state.data_ptr()
++                    # B70_PTR_WRAP_BASE: XPU device pointers can sit at >= 2**63;
++                    # store two's-complement-wrapped so int64 tensors hold
++                    # the exact same bits (kernels only add small offsets).
++                    _b70_ptr = state.data_ptr()
++                    self.state_base_addrs[idx] = (
++                        _b70_ptr - (1 << 64) if _b70_ptr >= (1 << 63) else _b70_ptr
++                    )
+ 
+                     # Block stride (bytes between consecutive blocks)
+                     # state shape: [num_blocks, ...], stride(0) = elements per block
+@@ -852,7 +858,10 @@
+         )
+         self.block_table_stride_req = int(next(iter(strides)))
+         for i, bt in enumerate(block_tables):
+-            self.block_table_ptrs[i] = bt.data_ptr()
++            _b70_bt_ptr = bt.data_ptr()  # B70_PTR_WRAP_BT
++            self.block_table_ptrs[i] = (
++                _b70_bt_ptr - (1 << 64) if _b70_bt_ptr >= (1 << 63) else _b70_bt_ptr
++            )
+ 
+         self.is_initialized = True
+ 
+@@ -1088,8 +1097,14 @@
+                     state, block_ids, src_block_idx, accept_token_bias + 1
+                 )
+ 
+-                src_ptrs_np[offset] = copy_spec.start_addr
+-                dst_ptrs_np[offset] = state[dest_block_id].data_ptr()
++                _b70_src = copy_spec.start_addr  # B70_PTR_WRAP_CP
++                _b70_dst = state[dest_block_id].data_ptr()
++                src_ptrs_np[offset] = (
++                    _b70_src - (1 << 64) if _b70_src >= (1 << 63) else _b70_src
++                )
++                dst_ptrs_np[offset] = (
++                    _b70_dst - (1 << 64) if _b70_dst >= (1 << 63) else _b70_dst
++                )
+                 sizes_np[offset] = copy_spec.num_elements * state.element_size()
+                 offset += 1
+ 

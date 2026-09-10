@@ -1,0 +1,3 @@
+1796aa8bc8db4ac68d9cd19636cef88f3af81d2b
+origin	https://github.com/vllm-project/vllm-xpu-kernels.git (fetch)
+origin	https://github.com/vllm-project/vllm-xpu-kernels.git (push)

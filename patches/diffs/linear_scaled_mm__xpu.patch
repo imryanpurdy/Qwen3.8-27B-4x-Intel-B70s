@@ -1,0 +1,35 @@
+--- /home/bonz/qwen28/gh-stock/scaled_mm__xpu.py	2026-09-10 02:39:24.144994912 +0000
++++ /tmp/dead_scaled_mm__xpu.py	2026-09-10 02:40:43.946785373 +0000
+@@ -189,7 +189,12 @@
+         pass
+ 
+ 
++import os as _b70_os
++_B70_USE_W8A16 = _b70_os.environ.get('B70_FP8_FORCE_W8A8', '0') != '1'
++_B70_HAS_XE2_SMALL_M = hasattr(torch.ops._xpu_C, 'xe2_block_fp8_small_m')
+ class XPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
++    apply_input_quant = not _B70_USE_W8A16
++    print(f"[B70_FP8_STACK] apply_input_quant={apply_input_quant} use_w8a16={_B70_USE_W8A16} xe2_small_m={_B70_HAS_XE2_SMALL_M}", flush=True)
+     @classmethod
+     def is_supported(
+         cls, compute_capability: int | None = None
+@@ -274,6 +279,19 @@
+         # B is [N, K]; .t() gives [K, N] view (no copy).
+         # Bs is stored as [n_blocks, k_blocks] view; .t() recovers the
+         # contiguous [k_blocks, n_blocks] buffer that oneDNN expects.
++        if _B70_USE_W8A16:
++            M, K = A.shape
++            N = B.shape[0]
++            if (_B70_HAS_XE2_SMALL_M and M <= 40
++                    and K % 128 == 0 and N % 128 == 0):
++                return torch.ops._xpu_C.xe2_block_fp8_small_m(
++                    A, B.t(), Bs.t(), None)
++            return torch.ops._xpu_C.fp8_gemm_w8a16(
++                A,
++                B.t(),
++                Bs.t(),
++                torch.Tensor(),
++            )
+         return torch.ops._xpu_C.fp8_gemm(
+             A,
+             B.t(),

@@ -1,0 +1,6 @@
+# Pin LF: Git for Windows autocrlf rewrote working-tree bytes to CRLF and broke
+# hash-pinned patches and shell scripts in other B70 repos. Do not let it happen
+# here — patches apply byte-exactly and start.sh must not grow CR characters.
+* text=auto eol=lf
+*.so binary
+*.png binary
