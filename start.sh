@@ -50,6 +50,14 @@ MOUNTS=(
   -v "$SOURCES/model_executor__kernels__linear__scaled_mm__xpu.py:/$V/model_executor/kernels/linear/scaled_mm/xpu.py:ro"
 )
 
+# Optional extra env: EXTRA_ENV="VAR1=val1 VAR2=val2" (word-split, each becomes -e)
+EXTRA_ENV_ARGS=()
+if [[ -n "${EXTRA_ENV:-}" ]]; then
+    for kv in $EXTRA_ENV; do
+        EXTRA_ENV_ARGS+=(-e "$kv")
+    done
+fi
+
 # ---- launch ----------------------------------------------------------------
 # ENTRYPOINT gotcha: base image ENTRYPOINT is `vllm` — must use --entrypoint bash
 docker run -d --name "$CONTAINER" \
@@ -70,6 +78,7 @@ docker run -d --name "$CONTAINER" \
   -e CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD=4294967296 \
   -e CCL_SYCL_ALLTOALL_TMP_BUF=1 \
   -e "LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels:/opt/venv/lib:/usr/lib" \
+  "${EXTRA_ENV_ARGS[@]}" \
   "${MOUNTS[@]}" \
   "$IMAGE" \
   -lc "exec vllm serve /model --quantization fp8 --dtype float16 --tensor-parallel-size 4 --max-model-len 262144 --max-num-seqs 1 --async-scheduling --block-size 64 --mamba-ssm-cache-dtype float16 --max-num-batched-tokens 4096 --gpu-memory-utilization 0.85 --no-enable-prefix-caching --language-model-only --port 8000 --served-model-name qwen38 --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP_DEPTH:-5}}'"
