@@ -5,25 +5,26 @@ vLLM XPU TP4, MTP5 speculative decoding, 262,144-token context, and a **custom
 `xe2_block_fp8_small_m` CUTLASS kernel** for the small-M block-FP8 GEMMs that dominate
 single-user decode on this model.
 
-> **Status (2026-09-09):** the serving container is DOWN — the host rebooted on
-> 2026-09-06 and wiped `/tmp`, which held the kernel artifacts and patch scripts.
-> All recipe inputs were recovered and made durable (see `docs/RECOVERY-2026-09-09.md`).
-> Relaunch: `./start.sh`.
+> **Status (2026-09-10):** stack RECOVERED and serving. The 2026-09-06 host reboot
+> wiped `/tmp`, which held the kernel artifacts and patch scripts; everything was
+> reconstructed (see `docs/RECOVERY-2026-09-09.md`), relaunched from this repo's
+> durable `./start.sh`, and re-benchmarked (`docs/BENCHMARKS.md`).
 
-## Measured (jobe, 2026-09-06, median of 5, idle cooled box)
+## Measured (jobe, median of 5, idle cooled box)
 
-| Workload | tok/s |
-|---|---|
-| decode, short prompt (64) → 512 out | **81.1** |
-| decode, p512 → g128 | **46.1** |
-| decode, p1024 → g256 | **45.1** |
-| prefill E2E, 16k / 32k | ~3452 / ~3447 |
-| context | 262,144 (was 9,216 in the earlier bf16 config) |
+**2026-09-10 (graphs ON, shipped default):** p512→g128 **144.2** · p1024→g256
+**117.9** · short prose **92.3** · count-probe **222.4 @ k=7** — canary 5/5
+bit-identical vs eager. See `docs/CAMPAIGN-2026-09-10-GRAPHS.md`.
 
-vs the prior config (bf16 / MTP8 / 9k ctx): **+11–19% decode**. Honest framing:
-the custom kernel's edge over the stock path is ≈2× at small M (the decode-critical
-regime), not the multi-hundred-percent figures from stale early artifacts. Numbers
-from other repos (84.65 etc.) use different workloads — not comparable.
+| Workload | 2026-09-06 eager | 2026-09-10 graphs |
+|---|---|---|
+| decode, short prompt (64) → 512 out | 81.1* | **92.3** |
+| decode, p512 → g128 | 46.1 | **144.2** |
+| decode, p1024 → g256 | 45.1 | **117.9** |
+| prefill E2E, 16k / 32k | ~3452 / ~3447 | 3689 / 3531 |
+| context | 262,144 | 262,144 |
+
+\* repetitive-content artifact (acceptance ~5.9); prose-class equivalent was ~40 eager.
 
 ## What's in this repo
 
@@ -82,7 +83,11 @@ docker exec qwen28tp4m python -c "import torch, vllm_xpu_kernels._xpu_C as m; pr
 Verified live contract (do not "fix" these — they are load-bearing):
 - `VLLM_XPU_FP8_BLOCK_W8A16=1` + `--dtype float16`, or you land on the slower W8A8 path silently.
 - Do NOT set `CCL_ATL_TRANSPORT=ofi` (prefill 3538 → 1132 tok/s on this box).
-- MTP **5** (measured better than 8). `VLLM_XPU_ENABLE_XPU_GRAPH=1` + MTP = corrupted outputs — leave off.
+- MTP **5** for general serving; k=7 for high-acceptance workloads (222 tok/s
+  count-class). `VLLM_XPU_ENABLE_XPU_GRAPH=1` is ON by default in `start.sh`
+  (measured 2026-09-10: 144.2 tok/s p512 decode, canary 5/5 bit-identical vs
+  eager on this runtime — the old corruption does not reproduce; re-run the
+  canary after any runtime change). `GRAPH_MODE=eager` to disable.
 - Base image ENTRYPOINT is `vllm`: always `--entrypoint bash` + `-lc "... exec vllm serve ..."`.
 - One TP4 container at a time on the 4 cards (~25.75 GiB/card).
 - Op verification: import `vllm_xpu_kernels._xpu_C` first, then `hasattr` — a bare `import torch` check returns False (runtime TORCH_LIBRARY registration; `nm -D` also lies).
