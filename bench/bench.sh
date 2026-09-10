@@ -43,7 +43,8 @@ prompt = ("Explain the operational considerations for serving a large mixture-of
 rates = []
 for i in range(runs):
     body = json.dumps({"model": "qwen38", "prompt": prompt, "max_tokens": gt,
-                       "temperature": 0.0, "stream": True}).encode()
+                       "temperature": 0.0, "stream": True,
+                       "stream_options": {"include_usage": True}}).encode()
     req = urllib.request.Request(base + "/v1/completions", body,
                                  {"Content-Type": "application/json"})
     t0 = time.perf_counter(); first = last = None; toks = 0; toks_final = None
