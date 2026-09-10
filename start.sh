@@ -72,7 +72,7 @@ docker run -d --name "$CONTAINER" \
   -e "LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/vllm_xpu_kernels:/opt/venv/lib:/usr/lib" \
   "${MOUNTS[@]}" \
   "$IMAGE" \
-  -lc "exec vllm serve /model --quantization fp8 --dtype float16 --tensor-parallel-size 4 --max-model-len 262144 --max-num-seqs 1 --async-scheduling --block-size 64 --mamba-ssm-cache-dtype float16 --max-num-batched-tokens 4096 --gpu-memory-utilization 0.85 --no-enable-prefix-caching --language-model-only --port 8000 --served-model-name qwen38 --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":5}'"
+  -lc "exec vllm serve /model --quantization fp8 --dtype float16 --tensor-parallel-size 4 --max-model-len 262144 --max-num-seqs 1 --async-scheduling --block-size 64 --mamba-ssm-cache-dtype float16 --max-num-batched-tokens 4096 --gpu-memory-utilization 0.85 --no-enable-prefix-caching --language-model-only --port 8000 --served-model-name qwen38 --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP_DEPTH:-5}}'"
 
 ok "container $CONTAINER starting on :$PORT (weight load takes ~4 min)"
 ok "follow:  docker logs -f $CONTAINER"
