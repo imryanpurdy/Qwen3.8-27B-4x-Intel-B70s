@@ -46,7 +46,7 @@ for i in range(runs):
                        "temperature": 0.0, "stream": True}).encode()
     req = urllib.request.Request(base + "/v1/completions", body,
                                  {"Content-Type": "application/json"})
-    t0 = time.perf_counter(); first = last = None; toks = 0
+    t0 = time.perf_counter(); first = last = None; toks = 0; toks_final = None
     with urllib.request.urlopen(req) as r:
         for raw in r:
             line = raw.decode().strip()
@@ -54,12 +54,16 @@ for i in range(runs):
             payload = line[5:].strip()
             if payload == "[DONE]": break
             d = json.loads(payload)
-            if first is None and d.get("choices") and d["choices"][0].get("token"):
+            ch = (d.get("choices") or [{}])[0]
+            text = ch.get("text") or ""
+            if text and first is None:
                 first = time.perf_counter()
-            if first is not None:
+            if first is not None and text:
                 last = time.perf_counter(); toks += 1
             u = d.get("usage")
-            if u: toks_final = u.get("completion_tokens", toks)
+            if u and u.get("completion_tokens"):
+                toks_final = u["completion_tokens"]
+    if toks_final is None: toks_final = toks
     if first and last and last > first:
         rates.append((toks_final - 1) / (last - first))
 print(f"  decode tok/s runs: {[round(r, 1) for r in rates]}")
