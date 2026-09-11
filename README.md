@@ -103,15 +103,15 @@ throttle under back-to-back runs — idle cooled box, median ≥ 3–5; `max_mod
 prompt+output — read it live from `/v1/models`; W8A16 fires EOS earlier — never
 compare wall-time across dtype paths.
 
-## Two-mode serving (2026-09-10)
+## Concurrency (2026-09-10, validated)
 
-| Mode | Command | Single-stream | 4-stream aggregate |
-|---|---|---|---|
-| MTP5 (default) | `./start.sh` | **144.2** | ❌ mixed-batch crash (causal_conv1d) |
-| k=0 concurrency | `MTP_DEPTH=0 ./start.sh` | ~72 | **193.7** |
-
-`MAX_NUM_SEQS` (default 4) + MTP-aware capture buckets are in `start.sh`.
-See `docs/CONCURRENCY-2026-09-10.md` for the crash analysis and the split-wrapper fix spec.
+**One mode does both.** `./start.sh` = MTP5 + `MAX_NUM_SEQS=4`: single-stream
+**139.3** tok/s p512 (−3% wrapper cost vs 144.2) **and** 4-stream parallel
+aggregate **205.1** tok/s (51–54 per stream), with mixed-path canary 5/5
+bit-identical vs eager. The `causal_conv1d` mixed-batch crash is fixed by the
+split-wrapper in `patched-sources/_xpu_ops.py` (spec + non-spec populations
+served as two single-population kernel chains on compact token copies).
+Full analysis: `docs/CONCURRENCY-2026-09-10.md`.
 
 ## Credits
 
