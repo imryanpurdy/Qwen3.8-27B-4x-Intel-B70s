@@ -88,6 +88,13 @@ fi
 # falling back to eager (buckets = multiples of (k+1), capped at 64).
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
 K="${MTP_DEPTH:-5}"
+# MTP_DEPTH=0 disables speculative decoding entirely (this runtime rejects
+# num_speculative_tokens=0 — the flag must be omitted, not zeroed).
+if [[ "$K" -gt 0 ]]; then
+    SPEC_ARGS="--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":$K}'"
+else
+    SPEC_ARGS=""
+fi
 CAP_SIZES=$(python3 - "$MAX_NUM_SEQS" "$K" <<'PYEOF'
 import sys
 n, k = int(sys.argv[1]), int(sys.argv[2])
@@ -120,7 +127,7 @@ docker run -d --name "$CONTAINER" \
   "${EXTRA_ENV_ARGS[@]}" \
   "${MOUNTS[@]}" \
   "$IMAGE" \
-  -lc "exec vllm serve /model --quantization fp8 --dtype float16 --tensor-parallel-size 4 --max-model-len 262144 --max-num-seqs $MAX_NUM_SEQS --async-scheduling --block-size 64 --mamba-ssm-cache-dtype float16 --max-num-batched-tokens 4096 --gpu-memory-utilization 0.85 --no-enable-prefix-caching --language-model-only --port 8000 --served-model-name qwen38 --compilation-config '{\"cudagraph_capture_sizes\": [$CAP_SIZES]}' --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP_DEPTH:-5}}'"
+  -lc "exec vllm serve /model --quantization fp8 --dtype float16 --tensor-parallel-size 4 --max-model-len 262144 --max-num-seqs $MAX_NUM_SEQS --async-scheduling --block-size 64 --mamba-ssm-cache-dtype float16 --max-num-batched-tokens 4096 --gpu-memory-utilization 0.85 --no-enable-prefix-caching --language-model-only --port 8000 --served-model-name qwen38 --compilation-config '{\"cudagraph_capture_sizes\": [$CAP_SIZES]}' $SPEC_ARGS"
 
 ok "container $CONTAINER starting on :$PORT (weight load takes ~4 min)"
 ok "follow:  docker logs -f $CONTAINER"
