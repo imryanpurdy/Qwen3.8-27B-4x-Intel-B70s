@@ -183,6 +183,96 @@ def _gdn_attention_core_xpu_impl(
         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
     )
 
+    # ---------------------------------------------------------------------------
+    # Mixed batch (spec-decode + prefill/decode tokens in one step): the fused
+    # gdn_attention kernel rejects this shape outright. But the fused op is a
+    # thin chain of two split ops — causal_conv1d (-> {q,k,v,z,b,a} + conv_state)
+    # and gated_delta_rule (-> core_attn_out + ssm_state) — and each split op
+    # accepts a single population per call. So: serve both populations
+    # separately on compact token copies and scatter the results back.
+    #
+    # Correctness notes:
+    #   - Request cache slots never overlap across populations (a slot is in
+    #     exactly one phase per scheduler step), so conv_state/ssm_state
+    #     updates from the two calls touch disjoint slots.
+    #   - Rows are gathered in token_indx order; identity token indices on the
+    #     compact copies are correct whether the kernels gather inputs or
+    #     scatter outputs by token_indx.
+    #   - Pure-population steps (single-stream MTP, or k=0 concurrency) take
+    #     the original fused path unchanged.
+    # ---------------------------------------------------------------------------
+    mixed = num_spec_decodes > 0 and (num_prefills + num_decodes) > 0
+    if mixed:
+        dev = z.device
+        idx_sp = spec_token_indx.to(torch.long)
+        if non_spec_token_indx is not None:
+            idx_ns = non_spec_token_indx.to(torch.long)
+        else:
+            all_idx = torch.arange(num_actual_tokens, device=dev)
+            idx_ns = all_idx[~torch.isin(all_idx, idx_sp)].to(torch.long)
+        ns_t = int(idx_ns.numel())
+        sp_t = int(idx_sp.numel())
+        reorder = not self.gqa_interleaved_layout
+
+        z_ns = z.index_select(0, idx_ns).contiguous()
+        qkvz_ns = projected_states_qkvz.index_select(0, idx_ns).contiguous()
+        ba_ns = projected_states_ba.index_select(0, idx_ns).contiguous()
+        z_sp = z.index_select(0, idx_sp).contiguous()
+        qkvz_sp = projected_states_qkvz.index_select(0, idx_sp).contiguous()
+        ba_sp = projected_states_ba.index_select(0, idx_sp).contiguous()
+
+        conv_state = self.kv_cache[0]
+        ssm_state = self.kv_cache[1]
+
+        q_ns, k_ns, v_ns, b_ns, a_ns = torch.ops._xpu_C.causal_conv1d(
+            z_ns, qkvz_ns, ba_ns,
+            self.num_k_heads, self.num_v_heads, self.head_k_dim, self.head_v_dim,
+            conv_state, conv_weights, self.conv1d.bias, self.activation,
+            num_prefills, num_decodes, 0,
+            has_initial_state,
+            non_spec_query_start_loc, None, non_spec_state_indices_tensor,
+            None, None, None, None,
+            ns_t, self.tp_size, reorder)
+        out_ns = torch.empty((ns_t,) + tuple(core_attn_out.shape[1:]),
+                             dtype=core_attn_out.dtype, device=dev)
+        torch.ops._xpu_C.gated_delta_rule(
+            out_ns, q_ns, k_ns, v_ns, b_ns, a_ns,
+            self.num_v_heads, self.head_v_dim, self.A_log, self.dt_bias, ssm_state,
+            num_prefills, num_decodes, 0,
+            has_initial_state,
+            non_spec_query_start_loc, None, non_spec_state_indices_tensor,
+            None, None, None, None,
+            ns_t, self.tp_size)
+
+        spec_idx_identity = torch.arange(sp_t, dtype=torch.int32, device=dev)
+        q_sp, k_sp, v_sp, b_sp, a_sp = torch.ops._xpu_C.causal_conv1d(
+            z_sp, qkvz_sp, ba_sp,
+            self.num_k_heads, self.num_v_heads, self.head_k_dim, self.head_v_dim,
+            conv_state, conv_weights, self.conv1d.bias, self.activation,
+            0, 0, num_spec_decodes,
+            None,
+            None, None, None,
+            spec_query_start_loc, spec_idx_identity, spec_state_indices_tensor,
+            num_accepted_tokens,
+            sp_t, self.tp_size, reorder)
+        out_sp = torch.empty((sp_t,) + tuple(core_attn_out.shape[1:]),
+                             dtype=core_attn_out.dtype, device=dev)
+        torch.ops._xpu_C.gated_delta_rule(
+            out_sp, q_sp, k_sp, v_sp, b_sp, a_sp,
+            self.num_v_heads, self.head_v_dim, self.A_log, self.dt_bias, ssm_state,
+            0, 0, num_spec_decodes,
+            None,
+            None, None, None,
+            spec_query_start_loc, spec_idx_identity, spec_state_indices_tensor,
+            num_accepted_tokens,
+            sp_t, self.tp_size)
+
+        core_attn_out.index_copy_(0, idx_ns, out_ns)
+        core_attn_out.index_copy_(0, idx_sp, out_sp)
+        z.index_copy_(0, idx_ns, z_ns)
+        z.index_copy_(0, idx_sp, z_sp)
+        return
+
     torch.ops._xpu_C.gdn_attention(
         core_attn_out,
         z,
