@@ -103,6 +103,16 @@ throttle under back-to-back runs — idle cooled box, median ≥ 3–5; `max_mod
 prompt+output — read it live from `/v1/models`; W8A16 fires EOS earlier — never
 compare wall-time across dtype paths.
 
+## Two-mode serving (2026-09-10)
+
+| Mode | Command | Single-stream | 4-stream aggregate |
+|---|---|---|---|
+| MTP5 (default) | `./start.sh` | **144.2** | ❌ mixed-batch crash (causal_conv1d) |
+| k=0 concurrency | `MTP_DEPTH=0 ./start.sh` | ~72 | **193.7** |
+
+`MAX_NUM_SEQS` (default 4) + MTP-aware capture buckets are in `start.sh`.
+See `docs/CONCURRENCY-2026-09-10.md` for the crash analysis and the split-wrapper fix spec.
+
 ## Credits
 
 - vLLM XPU + `vllm-project/vllm-xpu-kernels` (base `1796aa8`), vLLM `ac7509e2b` line
